@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [xddxdd/nix-cachyos-kernel#110](https://github.com/xddxdd/nix-cachyos-kernel/issues/110))
   and the unresolvable `cache.garnix.io` from the `cachyos-kernel` preset.
   Pin configurations listing a cache on `attic.xuyh0120.win` are rejected.
+- Refuse redirects to the compromised host. The default client re-checks every
+  hop before the request is sent, and a lookup that still arrives there through
+  an injected client refuses the metadata.
 
 ### Changed
 

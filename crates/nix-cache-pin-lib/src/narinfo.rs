@@ -414,6 +414,22 @@ fn diagnostic_url(raw: &str) -> String {
     }
 }
 
+/// Reqwest's `Display` reports only the error kind; the refusal reason from a
+/// redirect policy lives in the source chain, so walk it for diagnostics.
+fn describe_fetch_error(error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let description = cause.to_string();
+        if !description.is_empty() && !text.contains(&description) {
+            text.push_str(": ");
+            text.push_str(&description);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 fn narinfo_url(cache: &str, hash: &str) -> String {
     match reqwest::Url::parse(cache) {
         Ok(mut url) => {
@@ -492,9 +508,21 @@ async fn fetch_narinfo_references(
             url: diagnostic_url(&url),
             method: "GET".into(),
             status: response.as_ref().ok().map(|r| r.status().as_u16()),
-            error: response.as_ref().err().map(ToString::to_string),
+            error: response.as_ref().err().map(describe_fetch_error),
         });
         let response = match response {
+            // An injected client may follow redirects on its own. The hop check
+            // in `http::client_builder` keeps the request away from the host;
+            // this arm refuses metadata that still arrived through it.
+            Ok(response) if crate::config::is_compromised_url(response.url()) => {
+                let error = "redirected to a compromised cache".to_string();
+                if let Some(attempt) = attempts.last_mut() {
+                    attempt.error = Some(error.clone());
+                }
+                error_cache.get_or_insert_with(|| cache.clone());
+                errors.push(format!("{cache}: {error}"));
+                continue;
+            }
             // Nix 2.34 filetransfer.cc accepts 200 and 201 for full content;
             // 203 is not in its successfulStatuses. No partial/empty responses.
             Ok(response) if matches!(response.status().as_u16(), 200 | 201) => response,
@@ -506,7 +534,7 @@ async fn fetch_narinfo_references(
             }
             Err(error) => {
                 error_cache.get_or_insert_with(|| cache.clone());
-                errors.push(format!("{cache}: {error}"));
+                errors.push(format!("{cache}: {}", describe_fetch_error(&error)));
                 continue;
             }
         };
@@ -1075,6 +1103,96 @@ mod tests {
         assert_eq!(result.availability, Availability::Missing);
         assert_eq!(result.attempts[0].status, Some(404));
         assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_narinfo_refuses_redirect_to_compromised_cache() {
+        // A mirror that redirects must not smuggle the lookup to the banned
+        // host: the client policy re-checks every hop before a request is sent.
+        let store_path = "/nix/store/00000000000000000000000000000000-hello-2.12";
+        let forbidden = MockServer::start().await;
+        crate::test_cache::hit(&forbidden, store_path).await;
+        let redirector = MockServer::start().await;
+        let location = format!(
+            "http://attic.xuyh0120.win:{}/{}.narinfo",
+            forbidden.address().port(),
+            "0".repeat(32)
+        );
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", location))
+            .mount(&redirector)
+            .await;
+        let client = crate::http::client_builder()
+            .resolve("attic.xuyh0120.win", *forbidden.address())
+            .build()
+            .unwrap();
+        let result = check_narinfo_availability(&client, store_path, &[redirector.uri()]).await;
+
+        assert_eq!(result.availability, Availability::Unknown);
+        assert_eq!(redirector.received_requests().await.unwrap().len(), 1);
+        assert!(forbidden.received_requests().await.unwrap().is_empty());
+        assert_eq!(result.attempts.len(), 1);
+        assert!(result.attempts[0].status.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("refusing redirect"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_narinfo_follows_redirect_to_a_trusted_cache() {
+        // Keep ordinary redirects working: only the compromised host and the
+        // hop limit are refused.
+        let store_path = "/nix/store/00000000000000000000000000000000-hello-2.12";
+        let cached = MockServer::start().await;
+        crate::test_cache::hit(&cached, store_path).await;
+        let redirector = MockServer::start().await;
+        let location = format!("{}/{}.narinfo", cached.uri(), "0".repeat(32));
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", location))
+            .mount(&redirector)
+            .await;
+        let client = crate::http::client_builder().build().unwrap();
+        let result = check_narinfo_availability(&client, store_path, &[redirector.uri()]).await;
+
+        assert_eq!(result.availability, Availability::Cached);
+        assert_eq!(redirector.received_requests().await.unwrap().len(), 1);
+        assert_eq!(cached.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_injected_client_redirect_to_compromised_cache_is_refused() {
+        // Embedders may inject a client with its own redirect policy; the
+        // lookup still refuses metadata that arrived through the banned host.
+        let store_path = "/nix/store/00000000000000000000000000000000-hello-2.12";
+        let forbidden = MockServer::start().await;
+        crate::test_cache::hit(&forbidden, store_path).await;
+        let redirector = MockServer::start().await;
+        let location = format!(
+            "http://attic.xuyh0120.win:{}/{}.narinfo",
+            forbidden.address().port(),
+            "0".repeat(32)
+        );
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", location))
+            .mount(&redirector)
+            .await;
+        let client = reqwest::Client::builder()
+            .resolve("attic.xuyh0120.win", *forbidden.address())
+            .build()
+            .unwrap();
+        let result = check_narinfo_availability(&client, store_path, &[redirector.uri()]).await;
+
+        assert_eq!(result.availability, Availability::Unknown);
+        assert_eq!(forbidden.received_requests().await.unwrap().len(), 1);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("redirected to a compromised cache"));
     }
 
     #[tokio::test]

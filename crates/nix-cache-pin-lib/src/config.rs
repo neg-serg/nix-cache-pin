@@ -21,17 +21,21 @@ fn default_version_attr() -> String {
 /// consulted again, not even as an availability oracle.
 const COMPROMISED_CACHE_HOST: &str = "attic.xuyh0120.win";
 
-/// Compare the host the lookup will actually reach: URL parsing lowercases and
+/// Compare the host a request will actually reach: URL parsing lowercases and
 /// percent-decodes the authority (`attic%2exuyh0120.win`), so a raw substring
-/// match alone can be bypassed.
-pub(crate) fn is_compromised_cache(cache: &str) -> bool {
-    let host = reqwest::Url::parse(cache)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_default();
+/// match alone can be bypassed. Also applied to every redirect hop.
+pub(crate) fn is_compromised_url(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
     let host = host.trim_end_matches('.');
-    host == COMPROMISED_CACHE_HOST
-        || host.ends_with(&format!(".{COMPROMISED_CACHE_HOST}"))
+    host == COMPROMISED_CACHE_HOST || host.ends_with(&format!(".{COMPROMISED_CACHE_HOST}"))
+}
+
+/// Reject a configured cache string, including unparsable strings that still
+/// mention the banned host.
+pub(crate) fn is_compromised_cache(cache: &str) -> bool {
+    reqwest::Url::parse(cache).is_ok_and(|url| is_compromised_url(&url))
         || cache.to_ascii_lowercase().contains(COMPROMISED_CACHE_HOST)
 }
 

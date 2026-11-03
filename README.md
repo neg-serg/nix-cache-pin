@@ -136,8 +136,9 @@ was shut down after a server compromise
 ([xddxdd/nix-cachyos-kernel#110](https://github.com/xddxdd/nix-cachyos-kernel/issues/110)),
 `cache.garnix.io` no longer resolves, and `cache.nixos.org` does not carry
 these kernels. Choose a cache you trust; nix-cache-pin rejects any cache URL on
-`attic.xuyh0120.win`. The preset still queries `hydra.lantian.pub`, which only
-reports build status and is never trusted for store paths.
+`attic.xuyh0120.win`, including a redirect that would lead a lookup there. The
+preset still queries `hydra.lantian.pub`, which only reports build status and is
+never trusted for store paths.
 
 ## Embedding in your own CLI
 
